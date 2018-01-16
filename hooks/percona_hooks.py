@@ -32,6 +32,7 @@ from charmhelpers.core.hookenv import (
 from charmhelpers.core.host import (
     service_restart,
     service_start,
+    service_stop,
     file_hash,
     lsb_release,
     CompareHostReleases,
@@ -194,9 +195,24 @@ def render_config(clustered=False, hosts=None):
     else:
         context['ipv6'] = False
 
+    if CompareHostReleases(lsb_release()['DISTRIB_CODENAME']) < 'bionic':
+        # myisam_recover is not valid for PXC 5.7 (introduced in Bionic) so we
+        # only set it for PXC 5.6.
+        context['myisam_recover'] = 'BACKUP'
+        context['wsrep_provider'] = '/usr/lib/libgalera_smm.so'
+    elif CompareHostReleases(lsb_release()['DISTRIB_CODENAME']) >= 'bionic':
+        context['wsrep_provider'] = '/usr/lib/galera3/libgalera_smm.so'
+        context['binlog_format'] = 'ROW'
+        context['default_storage_engine'] = 'InnoDB'
+        context['wsrep_log_conflicts'] = True
+        context['innodb_autoinc_lock_mode'] = '2'
+        context['pxc_strict_mode'] = 'ENFORCING'
+
     context.update(PerconaClusterHelper().parse_config())
-    render(os.path.basename(config_file),
-           config_file, context, perms=0o444)
+    config_files = [config_file,
+                    '/etc/mysql/percona-xtradb-cluster.conf.d/wsrep.cnf']
+    for conf_file in config_files:
+        render(os.path.basename(conf_file), conf_file, context, perms=0o444)
 
 
 def render_config_restart_on_changed(clustered, hosts, bootstrap=False):
@@ -235,7 +251,15 @@ def render_config_restart_on_changed(clustered, hosts, bootstrap=False):
             else:
                 action = service_start
 
+            # In case PXC was previously bootstrapped with this node, we need
+            # to stop the mysql@bootstrap service before starting mysql.
+            service_stop('mysql@bootstrap')
+
             while not action('mysql'):
+                # Store service name for workload status
+                kvstore = kv()
+                kvstore.set('service', 'mysql')
+
                 if attempts == max_retries:
                     raise Exception("Failed to start mysql (max retries "
                                     "reached)")

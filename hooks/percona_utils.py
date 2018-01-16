@@ -39,6 +39,7 @@ from charmhelpers.core.hookenv import (
     leader_get,
     leader_set,
 )
+from charmhelpers.core.unitdata import kv
 from charmhelpers.fetch import (
     apt_install,
     filter_installed_packages,
@@ -75,8 +76,6 @@ deb-src http://repo.percona.com/apt {release} main"""
 SEEDED_MARKER = "{data_dir}/seeded"
 HOSTS_FILE = '/etc/hosts'
 DEFAULT_MYSQL_PORT = 3306
-
-WSREP_FILE = "/etc/mysql/percona-xtradb-cluster.conf.d/wsrep.cnf"
 
 # NOTE(ajkavanagh) - this is 'required' for the pause/resume code for
 # maintenance mode, but is currently not populated as the
@@ -121,8 +120,10 @@ def determine_packages():
         # NOTE(beisner): Use recommended mysql-client package
         # https://launchpad.net/bugs/1476845
         # https://launchpad.net/bugs/1571789
+        # NOTE(coreycb): This will install percona-xtradb-cluster-server-5.6
+        # for >= wily and percona-xtradb-cluster-server-5.7 for >= bionic.
         return [
-            'percona-xtradb-cluster-server-5.6',
+            'percona-xtradb-cluster-server',
         ]
     else:
         return [
@@ -256,10 +257,10 @@ def get_cluster_hosts():
     return hosts
 
 
-SQL_SST_USER_SETUP = ("GRANT RELOAD, LOCK TABLES, REPLICATION CLIENT ON *.* "
+SQL_SST_USER_SETUP = ("GRANT {} ON *.* "
                       "TO 'sstuser'@'localhost' IDENTIFIED BY '{}'")
 
-SQL_SST_USER_SETUP_IPV6 = ("GRANT RELOAD, LOCK TABLES, REPLICATION CLIENT "
+SQL_SST_USER_SETUP_IPV6 = ("GRANT {} "
                            "ON *.* TO 'sstuser'@'ip6-localhost' IDENTIFIED "
                            "BY '{}'")
 
@@ -272,10 +273,15 @@ def get_db_helper():
 
 
 def configure_sstuser(sst_password):
+    # xtrabackup 2.4 (introduced in Bionic) needs PROCESS privilege for backups
+    permissions = "RELOAD, LOCK TABLES, REPLICATION CLIENT"
+    if CompareHostReleases(lsb_release()['DISTRIB_CODENAME']) >= 'bionic':
+        permissions = "RELOAD, LOCK TABLES, REPLICATION CLIENT, PROCESS"
+
     m_helper = get_db_helper()
     m_helper.connect(password=m_helper.get_mysql_root_password())
-    m_helper.execute(SQL_SST_USER_SETUP.format(sst_password))
-    m_helper.execute(SQL_SST_USER_SETUP_IPV6.format(sst_password))
+    m_helper.execute(SQL_SST_USER_SETUP.format(permissions, sst_password))
+    m_helper.execute(SQL_SST_USER_SETUP_IPV6.format(permissions, sst_password))
 
 
 # TODO: mysql charmhelper
@@ -428,21 +434,28 @@ def bootstrap_pxc():
     bootstrapped = service('bootstrap-pxc', 'mysql')
     if not bootstrapped:
         try:
-            # NOTE(jamespage): execute under systemd-run to ensure
-            #                  that the bootstrap-pxc mysqld does
-            #                  not end up in the juju unit daemons
-            #                  cgroup scope.
-            cmd = ['systemd-run', '--service-type=forking',
-                   'service', 'mysql', 'bootstrap-pxc']
-            subprocess.check_call(cmd)
+            if CompareHostReleases(lsb_release()['DISTRIB_CODENAME']) < 'bionic':
+                # NOTE(jamespage): execute under systemd-run to ensure
+                #                  that the bootstrap-pxc mysqld does
+                #                  not end up in the juju unit daemons
+                #                  cgroup scope.
+                cmd = ['systemd-run', '--service-type=forking',
+                       'service', 'mysql', 'bootstrap-pxc']
+                rc = subprocess.check_call(cmd)
+            else:
+                service('start', 'mysql@bootstrap')
+                # Store service name for workload status
+                kvstore = kv()
+                kvstore.set('service', 'mysql@bootstrap')
         except subprocess.CalledProcessError as e:
             msg = 'Bootstrap PXC failed'
             error_msg = '{}: {}'.format(msg, e)
             status_set('blocked', msg)
             log(error_msg, ERROR)
             raise Exception(error_msg)
-        # To make systemd aware mysql is running after a bootstrap
-        service('start', 'mysql')
+        if CompareHostReleases(lsb_release()['DISTRIB_CODENAME']) < 'bionic':
+            # To make systemd aware mysql is running after a bootstrap
+            service('start', 'mysql')
     log("Bootstrap PXC Succeeded", DEBUG)
 
 
@@ -595,7 +608,12 @@ def services():
 
     @returns [services] - list of strings that are service names.
     """
-    return ['mysql']
+    if CompareHostReleases(lsb_release()['DISTRIB_CODENAME']) < 'bionic':
+        svc = 'mysql'
+    else:
+        kvstore = kv()
+        svc = kvstore.get('service')
+    return [svc]
 
 
 def assess_status(configs):
